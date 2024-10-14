@@ -176,3 +176,99 @@ fn test_sorted_linked_list_small() {
 fn test_sorted_linked_list_full() {
     test_sorted_linked_list(8, 500);
 }
+
+#[test]
+fn test_error_doc_test_1() {
+    use std::sync::Arc;
+    use aarc::{AtomicArc, Snapshot};
+
+    let atomic = AtomicArc::new(Some(53)); // +1 strong count on val 53
+
+    let snapshot53 = atomic.load::<Snapshot<_>>().unwrap(); // snapshot doesn't affect counts
+    assert_eq!(*snapshot53, 53);
+
+    let arc53 = atomic.load::<Arc<_>>().unwrap(); // +1 strong count on val 53
+    assert_eq!(*arc53, 53);
+    assert_eq!(Arc::strong_count(&arc53), 2);
+
+    let arc75 = Arc::new(75); // +1 strong count on val 75
+    atomic.store(Some(&arc75)); // +1 strong on 75; -1 strong on 53 does not occur immediately
+    assert_eq!(Arc::strong_count(&arc53), 2);
+    assert_eq!(Arc::strong_count(&arc75), 2);
+
+    let snapshot75 = atomic.load::<Snapshot<_>>();
+    assert_eq!(*snapshot75.unwrap(), 75);
+}
+
+#[test]
+fn test_error_doc_test_2() {
+    use std::sync::Arc;
+    use aarc::{AtomicWeak, Snapshot};
+
+    let arc1 = Arc::new(53); // +1 strong count
+
+    let atomic = AtomicWeak::<_>::from(&arc1); // +1 weak count
+
+    let weak = atomic.load().unwrap(); // +1 weak count
+    assert_eq!(Arc::strong_count(&arc1), 1);
+    assert_eq!(Arc::weak_count(&arc1), 2);
+}
+
+#[test]
+fn test_understand_lib() {
+
+    let atomic = AtomicArc::new(Some(53));
+
+    // It's not a Arc, so Arc::strong_count is not available.
+    // assert_eq!(Arc::strong_count(*atomic), 1);
+    // 
+    // But it's a struct with a **atomic raw pointer** to a **std Arc** stored inside:
+    // 
+    // pub struct AtomicArc<T: 'static, R: Protect + Retire = StandardReclaimer>
+    //     ptr: AtomicPtr<T>, 
+    //          -> `null_ptr`` or `Arc::into_raw(Arc::new( input_data ))`
+    //     phantom: PhantomData<T>, 
+    //          -> x
+    //     phantom_r: PhantomData<R>, 
+    //          -> x
+    //
+    // So it can be From or Into `Arc` `Weak` seamlessly, as well as the the special `Snapshot`.
+    //
+
+    // -> Snapshot
+    //
+    // It will create a ProtectPtr when load.
+    //
+    // Self {
+    //     ptr: NonNull::new_unchecked(ptr.cast_mut()),
+    //     phantom: PhantomData,
+    //     _guard: R::protect_ptr(ptr as *mut u8),
+    // }
+    // 
+    // Key about `Snapshot`:
+    // - !Send and !Sync, so it's guard by threadlocal things.
+    // 
+    let snapshot53 = atomic.load::<Snapshot<_>>().unwrap();
+    assert_eq!(*snapshot53, 53);
+
+    // -> Arc or Weak
+    // 
+    // They are basically same things(in terms of therir memory layout).
+    // 
+    // (*ManuallyDrop::new(Self::from_raw(ptr))).clone() // add ref count when Arc
+    // 
+    let arc53 = atomic.load::<Arc<_>>().unwrap();
+    assert_eq!(*arc53, 53);
+    // +1 when `AtomicArc::new`, +1 when atomic.load
+    assert_eq!(Arc::strong_count(&arc53), 2);
+
+    // +1 strong count on val 75
+    let arc75 = Arc::new(75);
+    // +1 strong on 75; -1 strong on 53 does not occur immediately
+    atomic.store(Some(&arc75));
+    // So the `Arc::strong_count` isn't so useful when using `AtomicArc`.
+    // It will -1 when the Arc is dropped by the reclaimer.
+    assert_eq!(Arc::strong_count(&arc53), 2);
+    assert_eq!(Arc::strong_count(&arc75), 2);
+
+}

@@ -14,39 +14,54 @@ const SLOTS_PER_NODE: usize = 32;
 /// The default memory reclamation strategy.
 pub struct StandardReclaimer;
 
+mod standard_reclaimer_static {
+    use std::cell::RefCell;
+    use crate::smr::standard_reclaimer::SlotHandle;
+
+    bubble_core::thread_local! {
+        pub(super) static SLOT_HANDLE: RefCell<SlotHandle> = RefCell::default();
+    }
+}
+
 impl StandardReclaimer {
+    
     /// # Safety
     /// TODO: write docs for this and make it pub
     #[allow(dead_code)]
     pub(crate) unsafe fn cleanup() {
         for slot in Self::get_all_slots().iter(SeqCst) {
-            drop(slot.batch.take());
+            drop(slot.tlocal_batch.take());
             slot.primary_list.detach_head();
             for snapshot_ptr in slot.snapshots.iter(SeqCst) {
                 snapshot_ptr.conflicts.detach_head();
             }
         }
     }
+
     #[allow(dead_code)]
     pub(crate) fn cleanup_owned_slot() {
-        let handle = Self::SLOT_HANDLE.with_borrow(|h| h.0);
+        let handle = standard_reclaimer_static::SLOT_HANDLE.with_borrow(|h| h.0);
         if let Some(slot) = handle {
-            drop(slot.batch.take());
+            drop(slot.tlocal_batch.take());
             slot.primary_list.detach_head();
             for snapshot_ptr in slot.snapshots.iter(SeqCst) {
                 snapshot_ptr.conflicts.detach_head();
             }
         }
     }
+    
+    /// Get slots of all threads.
     fn get_all_slots() -> &'static UnrolledLinkedList<Slot, SLOTS_PER_NODE> {
-        static SLOTS: OnceLock<UnrolledLinkedList<Slot, SLOTS_PER_NODE>> = OnceLock::new();
+        // It's not so huge for a PC
+        bubble_core::lazy_static! {
+            static ref SLOTS: OnceLock<UnrolledLinkedList<Slot, SLOTS_PER_NODE>> = OnceLock::new();
+        }
         SLOTS.get_or_init(UnrolledLinkedList::default)
     }
-    thread_local! {
-        static SLOT_HANDLE: RefCell<SlotHandle> = RefCell::default();
-    }
+    
+    /// Get slot of current thread.
     fn get_or_claim_slot() -> &'static Slot {
-        Self::SLOT_HANDLE.with_borrow_mut(|handle| {
+        standard_reclaimer_static::SLOT_HANDLE.with_borrow_mut(|handle| {
             if let Some(slot) = handle.0 {
                 slot
             } else {
@@ -62,12 +77,15 @@ impl StandardReclaimer {
     }
 }
 
+/// [`RegionGuard`] is used for protecting that memory will not be reclaimed during the lifetime of this guard.
 pub struct RegionGuard {
     slot: &'static Slot,
 }
 
 impl Drop for RegionGuard {
     fn drop(&mut self) {
+        // No critical_sections in ptrs that managed by this slot
+        // Retire all ptrs in primary_list
         if self.slot.critical_sections.fetch_sub(1, SeqCst) == 1 {
             self.slot.primary_list.detach_head();
         }
@@ -84,6 +102,7 @@ impl Protect for StandardReclaimer {
     }
 }
 
+/// [`PtrGuard`] is used for protecting a pointer, ie. a raw pointer without ref count support.
 pub struct PtrGuard {
     snapshot_ptr: &'static SnapshotPtr,
 }
@@ -113,13 +132,16 @@ impl ProtectPtr for StandardReclaimer {
 
 impl Retire for StandardReclaimer {
     fn retire(ptr: *mut u8, f: fn(*mut u8)) {
-        let mut borrowed = Self::get_or_claim_slot().batch.borrow_mut();
+        // Just add it to the local batch
+        let mut borrowed = Self::get_or_claim_slot().tlocal_batch.borrow_mut();
         borrowed.functions.push((ptr, f));
         borrowed.ptrs.insert(ptr);
         if borrowed.functions.len() < borrowed.functions.capacity() {
             return;
         }
+        // If batch is full, check retire status of all slots
         let all_slots = Self::get_all_slots();
+        // batch_size is equal to the number of slots(aka. active theads)
         let next_batch_size = all_slots.get_nodes_count() * SLOTS_PER_NODE;
         let batch = mem::replace(
             &mut *borrowed,
@@ -133,13 +155,14 @@ impl Retire for StandardReclaimer {
         let batch_arc = UnsafeArc::new(batch, 1);
         for slot in all_slots.iter(SeqCst) {
             if slot.critical_sections.load(SeqCst) > 0 {
-                // If a thread is in a critical section, it must be made aware of any retirements.
+                // If a thread is in a critical section, it must be made aware of **any** retirements.
                 // The snapshots will be checked when that thread exits the critical section.
                 slot.primary_list.insert(batch_arc.clone(), Some(slot));
             } else {
                 // Otherwise, the snapshots must be checked immediately.
                 for snapshot_ptr in slot.snapshots.iter(SeqCst) {
                     let p = snapshot_ptr.ptr.load(SeqCst);
+                    // If any snapshot pointer in other threads still points to the pointer going to be retired
                     if !p.is_null() && batch_arc.ptrs.contains(&p) {
                         snapshot_ptr.conflicts.insert(batch_arc.clone(), None);
                     }
@@ -151,14 +174,44 @@ impl Retire for StandardReclaimer {
 
 const SNAPSHOT_PTRS_PER_NODE: usize = 8;
 
+/// A [`Slot`] is a thread-local storage unit for managing memory reclamation.
+/// 
+/// 1. Each thread claims its own [`Slot`] when it first interacts with the reclamation system.
+/// 2. The thread uses this Slot to manage its critical sections, protect pointers (snapshots), and collect retired objects.
+/// 3. When objects are retired, they're first added to the thread-local batch.
+/// 4. When the batch is full or when necessary, it's moved to the primary list for processing.
+/// 5. The reclaimer uses the information in the Slot (critical sections, snapshots) to determine when it's safe to actually free retired objects.
+/// 
+/// It's [`Sync`] and [`Sync`] because that other theads can access the Slot's 
+/// critical_sections(retire), primary_list(retire), is_claimed(get slot) and snapshots(retire&batch drop) fields, but not the tlocal_batch field.
 #[derive(Default)]
 struct Slot {
+
+    /// List of batches that need to be processed for memory relcamation when critical sections are active.
+    /// 
+    /// It's used for region guard, it may store batches from other threads.
     primary_list: CollectionList,
-    batch: RefCell<Batch>,
+
+    /// Thread-local of objects that have been retired but not yet added to the primary list.
+    tlocal_batch: RefCell<Batch>,
+
+    /// List of snapshot pointers that the thread is currently protecting from reclamation.
+    /// 
+    /// It's used for pointer guard
     snapshots: UnrolledLinkedList<SnapshotPtr, SNAPSHOT_PTRS_PER_NODE>,
+
     // TODO: snapshots could share entries if their pointers are equal
     // snapshots_by_addr_count: RefCell<HashMap<usize, usize>>,
+
+    /// Counter keeps track of how many critical sections(aka. region guard) are currently active for this thread.
+    /// 
+    /// While the critical_sections counter is non-zero, 
+    /// the memory reclamation system will not deallocate any objects 
+    /// that might be accessed in this critical section.
     critical_sections: AtomicUsize,
+    
+    /// Flag indicates whether this slot is currently claimed by a thread,
+    /// ensure that each thread gets its own unique slot.
     is_claimed: AtomicBool,
 }
 
@@ -203,9 +256,11 @@ impl CollectionList {
     }
 }
 
+/// A [`CollectionNode`] is just a node of Batch and its associated slot.
 struct CollectionNode {
     batch: UnsafeArc<Batch>,
     next: Option<UnsafeArc<CollectionNode>>,
+    /// Optional reference to a associated Slot, used for conflict checking when the node is dropped.
     check_on_drop: Option<&'static Slot>,
 }
 
@@ -223,11 +278,27 @@ impl Drop for CollectionNode {
     }
 }
 
+/// Group of multiple objects that have been retired and are waiting to be freed.
+/// 
+/// 1. When an object is retired (i.e., it's no longer in use 
+///    but can't be immediately freed due to potential concurrent access),it's added to a Batch.
+/// 2. The object's pointer and its deallocation function are added to the functions vector.
+/// 3. The pointer is also added to the ptrs set for quick lookup.
+/// 4. Objects in a Batch are held until it's **determined(by check conflict)** safe to deallocate them,
+///    by drop the batch itself.
+/// 
+/// The `functions` and `ptrs` vec are used as fixed capacity vec, with variable capacity per batch
 #[derive(Default)]
 struct Batch {
+    /// 0 -> raw pointer (*mut u8) to the object that needs to be freed.
+    /// 1 -> function pointer (fn(*mut u8)) that will be called to free the object.
+    /// ensure type safety
     // (type is not over-complex)
     #[allow(clippy::type_complexity)]
     functions: Vec<(*mut u8, fn(*mut u8))>,
+    /// Set of raw pointers to all the objects in the batch.
+    /// 
+    /// Used to fast check if a pointer is in the batch.
     ptrs: HashSet<*mut u8>,
 }
 
@@ -294,7 +365,7 @@ mod tests {
 
             drop(guard);
 
-            drop(slot.batch.take());
+            drop(slot.tlocal_batch.take());
             assert!((*flag_ptr).get());
         });
     }
@@ -312,7 +383,7 @@ mod tests {
     fn test_protect_ptr_and_release() {
         with_flag(|flag_ptr, flag_fn| unsafe {
             let slot = StandardReclaimer::get_or_claim_slot();
-            slot.batch.replace(Batch {
+            slot.tlocal_batch.replace(Batch {
                 functions: Vec::with_capacity(1),
                 ptrs: HashSet::with_capacity(1),
             });

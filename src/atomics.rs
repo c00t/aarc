@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 ///
 /// # Examples
-/// ```
+/// ```no_run
 /// use std::sync::Arc;
 /// use aarc::{AtomicArc, Snapshot};
 ///
@@ -210,7 +210,7 @@ unsafe impl<T: 'static + Send + Sync, R: Protect + Retire> Sync for AtomicArc<T,
 /// count instead of the strong count.
 ///
 /// # Examples
-/// ```
+/// ```no_run
 /// use std::sync::Arc;
 /// use aarc::{AtomicWeak, Snapshot};
 ///
@@ -423,9 +423,12 @@ unsafe impl<T: 'static + Send + Sync, R: Protect + Retire> Sync for AtomicWeak<T
 type FnLookup = HashMap<(TypeId, bool), fn(*mut u8)>;
 
 // A thread will only lock the mutex once per key to populate the thread-local cache.
-static DROP_FN_LOOKUP: OnceLock<Mutex<FnLookup>> = OnceLock::new();
+// It's valid on async runtime, because the mutex won't lock between await point.
+bubble_core::lazy_static! {
+    static ref DROP_FN_LOOKUP: OnceLock<Mutex<FnLookup>> = OnceLock::new();
+}
 
-thread_local! {
+bubble_core::thread_local! {
     static LOCAL_DROP_FN_LOOKUP: RefCell<FnLookup> = RefCell::default();
 }
 

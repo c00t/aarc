@@ -7,8 +7,19 @@ homepage = "https://github.com/aarc-rs/aarc"
 repository = "https://github.com/aarc-rs/aarc"
 license = "MIT"
 keywords = ["atomic", "arc", "thread-safe", "sync", "lock-free"]
-categories = ["concurrency", "memory-management", "data-structures", "algorithms"]
+categories = [
+    "concurrency",
+    "memory-management",
+    "data-structures",
+    "algorithms",
+]
 exclude = [".github/", ".gitignore", "target/"]
+
+[dependencies]
+bubble-core = { path = "../../../app/bubble_core" }
 
 [dev-dependencies]
 rand = "0.8"
+# for testing, need to enable the "host" feature to work with tls, it's not enabled by default,
+# and there is no interaction with dynamic library, so "plugin" is irrelevant.
+bubble-core = { path = "../../../app/bubble_core", features = ["host"] }
