@@ -11,7 +11,7 @@ categories = ["concurrency", "memory-management", "data-structures", "algorithms
 exclude = [".github/", ".gitignore", "target/"]
 
 [dependencies]
-fast-smr = "0.2.2"
+fast-smr = { path = "../fast-smr"}
 
 [dev-dependencies]
 rand = "0.8"
