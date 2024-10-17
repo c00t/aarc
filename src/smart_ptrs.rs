@@ -265,3 +265,6 @@ mod tests {
         }
     }
 }
+
+unsafe impl<T> Send for Arc<T> {}
+unsafe impl<T> Sync for Arc<T> {}
