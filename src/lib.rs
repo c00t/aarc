@@ -8,6 +8,7 @@ pub use smart_ptrs::Guard;
 pub use smart_ptrs::RefCount;
 pub use smart_ptrs::StrongPtr;
 pub use smart_ptrs::Weak;
+pub use fast_smr::smr::increment_era;
 
 pub(crate) mod atomics;
 
