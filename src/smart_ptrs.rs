@@ -266,5 +266,6 @@ mod tests {
     }
 }
 
-unsafe impl<T> Send for Arc<T> {}
-unsafe impl<T> Sync for Arc<T> {}
+unsafe impl<T: 'static + Send + Sync> Send for Arc<T> {}
+
+unsafe impl<T: 'static + Send + Sync> Sync for Arc<T> {}
