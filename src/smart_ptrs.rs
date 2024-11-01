@@ -93,6 +93,13 @@ impl<T: 'static> Arc<T> {
     pub(crate) unsafe fn increment_strong_count(ptr: *const T) {
         _ = ManuallyDrop::new(Self::from_raw(ptr)).clone();
     }
+    pub fn downgrade(&self) -> Weak<T> {
+        unsafe {
+            let ptr = self.as_ptr();
+            Weak::increment_weak_count(ptr);
+            Weak::from_raw(ptr)
+        }
+    }
 }
 
 impl<T: 'static> Clone for Arc<T> {
@@ -144,6 +151,17 @@ impl<T: 'static> Weak<T> {
     pub(crate) unsafe fn from_raw(ptr: *const T) -> Self {
         Self {
             ptr: NonNull::new_unchecked(find_inner_ptr(ptr).cast_mut()),
+        }
+    }
+    pub fn upgrade(&self) -> Option<Arc<T>> {
+        if self.strong_count() > 0 {
+            unsafe {
+                let ptr = self.as_ptr();
+                Arc::increment_strong_count(ptr);
+                Some(Arc::from_raw(ptr))
+            }
+        } else {
+            None
         }
     }
 }
@@ -269,3 +287,7 @@ mod tests {
 unsafe impl<T: 'static + Send + Sync> Send for Arc<T> {}
 
 unsafe impl<T: 'static + Send + Sync> Sync for Arc<T> {}
+
+unsafe impl<T: 'static + Send + Sync> Send for Weak<T> {}
+
+unsafe impl<T: 'static + Send + Sync> Sync for Weak<T> {}
